@@ -1,3 +1,6 @@
+import {createTrips} from './trips.js';
+import {statistics,routeKey,quality} from './learning.js';
+let learning=null, learningError='';
 const $ = id => document.getElementById(id);
 const cfg = window.BUS_TRACKER_CONFIG;
 const mapsCfg = window.BUS_MAPS_CONFIG;
@@ -51,7 +54,8 @@ function fit() {
   if (!bounds.isEmpty()) map.fitBounds(bounds, 48);
 }
 $('fit').onclick = fit;
-function save(lat, lng) {
+async function save(lat, lng) {
+  try { if(!learning) throw Error("Firebase 尚未就緒"); await learning.settings({lat,lng}, $("routeName").value); learningError=""; } catch(e) { $("destStatus").textContent=e.message; return; }
   locateVersion++;
   destination = {lat, lng};
   invalidate(); fitted = false; windowRouteDrawn = false; showDestination(); updateMarkers();
@@ -70,6 +74,7 @@ $('destination').onsubmit = e => {
   save(Number(a), Number(b));
 };
 $('clear').onclick = () => {
+  if(learning?.state.id){$('destStatus').textContent='行程中無法清除目的地。';return;}
   locateVersion++; destination = null; invalidate(); showDestination(); updateMarkers();
   try { localStorage.removeItem('bus-destination'); } catch {}
   $('destStatus').textContent = '已清除目的地。'; render();
@@ -100,6 +105,7 @@ async function compute() {
   const version = generation;
   const origin = {lat: data.latitude, lng: data.longitude};
   const originTimestamp = data.gpsTimestamp;
+  const captured={...data}, tripId=learning?.state.id, requestedAt=learning?.now() || Date.now();
   routeMessage = '正在更新道路路線與路況…'; render();
   try {
     const result = await Route.computeRoutes({
@@ -119,6 +125,12 @@ async function compute() {
     polylines.forEach(p => p.setMap(map));
     estimate = {duration: route.durationMillis, distance: route.distanceMeters, at: Date.now(), fallback: !!result.fallbackInfo};
     routeMessage = '';
+    if(learning && tripId && tripId===learning.state.id && learning.state.trip?.status==='active') {
+      const reasons=quality({accuracy:captured.accuracy,timestamp:captured.gpsTimestamp,gapMs:captured.gapMs},learning.now());
+      if(result.fallbackInfo) reasons.push('google-fallback');
+      if(captured.tripId!==tripId) reasons.push('different-trip');
+      void learning.sample(tripId,{timestamp:requestedAt,recordedAt:learning.now(),gpsTimestamp:originTimestamp,lat:origin.lat,lng:origin.lng,accuracy:captured.accuracy??null,gapMs:captured.gapMs??null,googleEtaSeconds:route.durationMillis/1000,distanceMeters:route.distanceMeters,valid:reasons.length===0,reasons:reasons.join(',')}).catch(e=>{learningError='ETA 寫入失敗：'+e.message;renderLearning();});
+    }
     if (!fitted || !windowRouteDrawn) { fit(); fitted = true; windowRouteDrawn = true; }
   } catch (e) {
     if (version === generation) {
@@ -142,6 +154,7 @@ function render() {
   $('distance').textContent = current ? (estimate.distance < 1000 ? Math.round(estimate.distance) + ' 公尺' : (estimate.distance / 1000).toFixed(2) + ' 公里') : '—';
   $('eta').textContent = current ? '約 ' + Math.max(1, Math.ceil(estimate.duration / 60000)) + ' 分鐘' : '—';
   $('arrival').hidden = !(current && estimate.duration <= 300000);
+  renderLearning(current);
   $('etaNote').textContent = !destination ? '請先設定接送目的地。' : !data ? '等待車輛位置。' :
     !fresh() || !connected ? '等待連線與新 GPS 位置；暫停 ETA 與抵達提醒。' : mapFailed ? '地圖服務無法使用，GPS 接收仍持續運作。' :
     routeMessage || (current ? (estimate.fallback ? 'Google 已降級估算，可能未完整納入路況。' : '依 Google 道路路線與可用路況估算。') +
@@ -184,6 +197,15 @@ async function initFirebase() {
     ]);
     const db = database.getDatabase(app.initializeApp(cfg.firebaseConfig));
     const {ref, onValue} = database;
+    learning=createTrips(db,database,cfg.vehicleId,s=>{
+      const chosen=s.trip?.status==='active'?{destination:s.trip.destination,route:s.trip.route}:s.settings;
+      if(chosen){
+        $('routeName').value=chosen.route;
+        if(JSON.stringify(destination)!==JSON.stringify(chosen.destination)){destination=chosen.destination;invalidate();showDestination();updateMarkers();schedule();}
+      }
+      for(const id of ['lat','lng','routeName','locate','clear']) $(id).disabled=!!s.id;
+      renderLearning();
+    },e=>{learningError='V3 資料讀寫失敗：'+e.message+'；請查看 README 的測試版 Rules。';renderLearning();});
     onValue(ref(db, '.info/serverTimeOffset'), s => { offset = Number(s.val()) || 0; });
     onValue(ref(db, '.info/connected'), s => {
       connected = s.val() === true;
@@ -215,3 +237,23 @@ document.addEventListener('visibilitychange', () => {
   else { dirty = true; schedule(); }
   render();
 });
+
+function renderLearning(current=usable() && estimate && Date.now()-estimate.at<=staleAfter && !mapFailed){
+ if(!learning)return;
+ const s=learning.state, active=s.trip?.status==='active', key=destination?routeKey(cfg.vehicleId,$('routeName').value,destination):'';
+ const result=statistics(s.history,key,current?estimate.duration/1000:null);
+ $('tripCount').textContent=result.count+' 次';
+ $('meanError').textContent=result.mean===null?'學習中':(result.mean>=0?'+':'')+(result.mean/60).toFixed(1)+' 分鐘';
+ $('rawEta').textContent=current?'約 '+Math.ceil(estimate.duration/60000)+' 分鐘':'—';
+ $('correctedEta').textContent=!current?'等待本次 ETA':result.corrected===null?'學習中（未套用）':'約 '+Math.ceil(result.corrected/60)+' 分鐘';
+ $('learnStatus').textContent=learningError || (result.residual===null?'學習中：同一路線及目前 ETA 區間各需 5 次有效行程。':'已套用歷史中位數誤差 '+(result.residual/60).toFixed(1)+' 分鐘。')+' 此區間：'+result.bucketCount+' 次。';
+ $('activeStatus').textContent=active?'行程進行中：'+s.trip.route: s.id?'行程已結束；發射端可開始下一次。':'尚未開始行程';
+ $('arrived').disabled=!active || !s.connected;
+ if(current && result.corrected!==null) $('arrival').hidden=result.corrected>300;
+}
+$('arrived').onclick=async()=>{
+ if(!confirm('確認娃娃車現在已實際抵達接送目的地？'))return;
+ $('arrived').disabled=true;
+ try{await learning.finish(true);learningError='';}catch(e){learningError='抵達記錄失敗：'+e.message;}
+ renderLearning();
+};

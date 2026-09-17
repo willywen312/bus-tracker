@@ -1,0 +1,29 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "vehicles": {
+      "demo-bus-001": {
+        ".read": true,
+        ".write": true
+      }
+    },
+    "trips": {
+      ".read": true,
+      ".indexOn": ["vehicleId"],
+      "$tripId": {
+        ".write": "(!data.exists() && newData.child('vehicleId').val() === 'demo-bus-001') || data.child('vehicleId').val() === 'demo-bus-001'",
+        ".validate": "newData.hasChildren(['version', 'vehicleId', 'status', 'startTime', 'destination', 'route', 'routeKey']) && newData.child('vehicleId').val() === 'demo-bus-001' && newData.child('version').val() === 3",
+        "status": {".validate": "newData.val() === 'active' || newData.val() === 'arrived' || newData.val() === 'ended' || newData.val() === 'abandoned'"},
+        "startTime": {".validate": "newData.isNumber()"},
+        "endTime": {".validate": "newData.isNumber()"},
+        "actualArrivalTime": {".validate": "newData.isNumber() && newData.val() >= newData.parent().child('startTime').val()"},
+        "destination": {
+          ".validate": "newData.hasChildren(['lat', 'lng'])",
+          "lat": {".validate": "newData.isNumber() && newData.val() >= -90 && newData.val() <= 90"},
+          "lng": {".validate": "newData.isNumber() && newData.val() >= -180 && newData.val() <= 180"}
+        }
+      }
+    }
+  }
+}
